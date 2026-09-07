@@ -101,13 +101,17 @@ def _is_rate_limited(exc: Exception) -> bool:
 
     if not isinstance(exc, errors.ClientError):
         return False
+    return _client_error_status(exc) == 429
+
+
+def _client_error_status(exc: Exception) -> int | None:
     response = getattr(exc, "response", None)
     status = (
         getattr(exc, "status_code", None)
         or getattr(exc, "code", None)
         or getattr(response, "status_code", None)
     )
-    return status == 429
+    return status if isinstance(status, int) else None
 
 
 async def _generate_with_retry(generate_call):
@@ -182,17 +186,24 @@ async def research_company(company_name: str) -> AsyncGenerator[dict, None]:
     as each section completes. Stops early and yields an "error" event if the
     company can't be researched at all (e.g. gibberish input).
     """
-    client = None
-    if not MOCK_MODE:
-        from google import genai
-
-        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-
     if MOCK_MODE:
         for section in SECTION_ORDER:
             yield {"type": "section_start", "section": section}
             data = await _mock_section(section)
             yield {"type": "section_complete", "section": section, "data": data}
+        return
+
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    except Exception:
+        logger.exception("Could not initialize Gemini client for company=%r", company_name)
+        yield {
+            "type": "error",
+            "message": "The research service could not authenticate. Check the Gemini API key "
+            "and try again.",
+        }
         return
 
     for section in SECTION_ORDER:
@@ -202,17 +213,25 @@ async def research_company(company_name: str) -> AsyncGenerator[dict, None]:
         raw_text = await _grounded_search(client, company_name)
         report = await _structure_report(client, company_name, raw_text)
     except RateLimitError:
+        logger.warning("Gemini rate limit persisted after retry for company=%r", company_name)
         yield {
             "type": "error",
             "message": "The research service is rate-limited right now, please wait a minute "
             "and try again.",
         }
         return
-    except Exception:
+    except Exception as exc:
         logger.exception("Research failed for company=%r", company_name)
+        if _client_error_status(exc) in {401, 403}:
+            message = (
+                "The research service could not authenticate. Check the Gemini API key "
+                "and try again."
+            )
+        else:
+            message = f"Something went wrong researching {company_name}. Please try again."
         yield {
             "type": "error",
-            "message": f"Something went wrong researching {company_name}. Please try again.",
+            "message": message,
         }
         return
 
